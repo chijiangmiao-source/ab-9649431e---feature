@@ -16,7 +16,7 @@
   </header>
 
   <main>
-    <section class="card" aria-labelledby="h-input">
+    <section class="card" id="card-input" aria-labelledby="h-input">
       <h2 id="h-input">一、录入复核草稿</h2>
 
       <div class="grid keys">
@@ -83,11 +83,23 @@ placeholder="prepare M1 FP-OLD-7F3A&#10;activate M1&#10;issue M1 ORD-1&#10;recov
         初态指纹处可直接填写完整指纹，也可写 <code>旧</code>/<code>新</code> 代指当前声明的指纹。
       </p>
 
+      <label class="wide">现场事件前缀（可留空；每行一步，至多 8 步；仅为已观察记录，不会追加为新指令）
+        <textarea id="prefix" rows="5" spellcheck="false"
+placeholder="M1 #1 投递&#10;M1 #1 落盘&#10;M1 #2 投递&#10;# 格式：模块 #指令序号 事件&#10;# 事件：投递 / 落盘 / 确认 / 断电前 / 断电后 / 断电确认 / 迟到确认；recover 指令记“恢复”"></textarea>
+      </label>
+      <p class="hint">
+        前缀先按既有持久化语义逐步归约：复核只承认当前双模块状态下确实可发生的
+        <strong>投递、落盘、确认、断电、恢复</strong>事件；首个不合法步骤会被稳定定位并清除旧结论。
+        若前缀本身已构成违约，完整见证即该前缀；否则从归约后的双模块状态继续穷尽尚未发生的交织。
+        指令序号 <code>#n</code> 即上方控制端发起顺序（从 1 起）。
+      </p>
+
       <div class="actions">
         <button id="btn-run" class="primary" type="button">复核</button>
         <button id="btn-clear" type="button">清空草稿与结论</button>
         <button id="btn-stop" type="button" hidden>停止穷举</button>
         <span id="counter" class="counter"></span>
+        <span id="prefix-counter" class="counter"></span>
       </div>
     </section>
 

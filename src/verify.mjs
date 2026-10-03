@@ -137,8 +137,11 @@ async function httpSmoke() {
   let ok = true;
   ok = ok && (await expect('/healthz', { status: 200, contains: '"status":"ok"', contentType: 'application/json' }));
   ok = ok && (await expect('/', { status: 200, contains: '航电密钥轮换复核台', contentType: 'text/html' }));
+  ok = ok && (await expect('/', { status: 200, contains: '现场事件前缀' }));
+  ok = ok && (await expect('/', { status: 200, contains: 'id="prefix"' }));
   ok = ok && (await expect('/index.html', { status: 200, contains: '/app.js' }));
   ok = ok && (await expect('/app.js', { status: 200, contains: 'worker.mjs' }));
+  ok = ok && (await expect('/app.js', { status: 200, contains: 'prefixText' }));
   ok = ok && (await expect('/worker.mjs', { status: 200, contains: 'analyze' }));
   ok = ok && (await expect('/src/core.mjs', { status: 200, contains: 'explore' }));
   ok = ok && (await expect('/styles.css', { status: 200, contentType: 'text/css' }));
@@ -202,7 +205,38 @@ async function workerSmoke() {
     log('worker', `安全场景结果异常：${JSON.stringify(safe).slice(0, 300)}`);
     return false;
   }
-  log('worker', 'Worker 运行时冒烟通过（违约检出 / 安全结论 / 进度回传）');
+  // 现场前缀流程：含前缀的违约场景，见证须以该前缀开头；非法前缀须报错
+  const prefixed = await run({
+    oldFp: 'OLD-FP',
+    newFp: 'NEW-FP',
+    modules: [mk('M1'), mk('M2')],
+    instructionsText:
+      'prepare M1 OLD-FP\nactivate M1\nissue M1 R\nprepare M2 NEW-FP\nactivate M2\nissue M2 R',
+    prefixText: 'M1 #1 投递\nM1 #1 落盘\nM1 #1 确认',
+  });
+  if (
+    !prefixed.ok ||
+    !prefixed.report.violation ||
+    prefixed.report.prefixLength !== 3 ||
+    prefixed.report.witnessActions.slice(0, 3).some(
+      (a, k) => a.m !== 0 || a.i !== 0 || a.kind !== [0, 1, 4][k],
+    )
+  ) {
+    log('worker', `现场前缀场景结果异常：${JSON.stringify(prefixed).slice(0, 300)}`);
+    return false;
+  }
+  const illegalPrefix = await run({
+    oldFp: 'OLD-FP',
+    newFp: 'NEW-FP',
+    modules: [mk('M1'), mk('M2')],
+    instructionsText: 'prepare M1 OLD-FP\nactivate M1',
+    prefixText: 'M1 #1 确认',
+  });
+  if (illegalPrefix.ok || !illegalPrefix.prefixInvalid || !/第 1 步/.test(illegalPrefix.errors[0] || '')) {
+    log('worker', `非法前缀结果异常：${JSON.stringify(illegalPrefix).slice(0, 300)}`);
+    return false;
+  }
+  log('worker', 'Worker 运行时冒烟通过（违约检出 / 安全结论 / 进度回传 / 现场前缀归约 / 非法前缀）');
   return true;
 }
 

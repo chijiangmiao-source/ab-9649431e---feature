@@ -115,6 +115,8 @@ table.trace { border-collapse: collapse; width: 100%; font: 12.5px var(--mono); 
 table.trace th, table.trace td { border: 1px solid var(--line); padding: 6px 9px; text-align: left; vertical-align: top; }
 table.trace th { background: var(--panel-2); color: var(--muted); position: sticky; top: 0; }
 table.trace tr.step-initial td { color: var(--muted); }
+table.trace tr.step-prefix td { background: #172535; }
+.badge.prefixbadge { background: #1d3550; color: #9cc8f0; margin-right: 6px; }
 td.stepno { text-align: right; color: var(--muted); width: 42px; }
 .ev { white-space: nowrap; }
 .ev .kind { color: var(--accent); }

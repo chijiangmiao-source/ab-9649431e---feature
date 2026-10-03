@@ -589,3 +589,210 @@ issue M2 Z1`,
   // 指令物理行号保留：#5(2) 签发实际在第 5 行
   assert.equal(r.model.instructions[2].lineNo, 5);
 });
+
+// ---------- 现场事件前缀 ----------
+
+function withPrefix(d, prefixText) {
+  return { ...d, prefixText };
+}
+
+test('前缀归约：合法前缀先逐步归约，再从归约态穷尽最短后续反例并拼接见证', () => {
+  const d = draft({
+    m1: mod('M1'),
+    m2: mod('M2'),
+    prog: `prepare M1 ${OLD}
+activate M1
+issue M1 P
+prepare M2 ${NEW}
+activate M2
+issue M2 P`,
+  });
+  const base = analyze(d);
+  assert.equal(base.report.violation, true);
+  assert.equal(base.report.witnessActions.length, 16);
+
+  const prefix = 'M1 #1 投递\nM1 #1 落盘\nM1 #1 确认\n';
+  const r = analyze(withPrefix(d, prefix));
+  assert.equal(r.ok, true, JSON.stringify(r.errors));
+  assert.equal(r.report.violation, true);
+  assert.equal(r.report.withinPrefix, false);
+  assert.equal(r.report.prefixLength, 3);
+  // 完整见证 = 3 步前缀 + 13 步最短后续；总长度与无前缀最短交织一致
+  assert.equal(r.report.witnessActions.length, 16);
+  assert.equal(r.report.steps.length, 17);
+  assert.deepEqual(
+    r.report.witnessActions.slice(0, 3),
+    [
+      { m: 0, kind: EVT.DELIVER, i: 0 },
+      { m: 0, kind: EVT.WRITE, i: 0 },
+      { m: 0, kind: EVT.ACK, i: 0 },
+    ],
+  );
+  // 第 3 步快照：M1 已暂存旧密钥，仍未激活
+  assert.equal(r.report.steps[3].modules[0].prep, 0);
+  assert.equal(r.report.steps[3].modules[0].epoch, -1);
+});
+
+test('前缀自身形成违约：完整见证仅为该前缀，不外推尚未发生的交织', () => {
+  // 初态 M1 旧纪元在线、M2 新纪元在线；各自仅一条签发指令，
+  // 双方签发都落盘即构成违约（4 步），无须穷尽。
+  const d = draft({
+    m1: mod('M1', { epoch: '0' }),
+    m2: mod('M2', { epoch: '1' }),
+    prog: 'issue M1 P\nissue M2 P',
+  });
+  const prefix = 'M1 #1 投递\nM1 #1 落盘\nM2 #2 投递\nM2 #2 落盘';
+  const r = analyze(withPrefix(d, prefix));
+  assert.equal(r.ok, true, JSON.stringify(r.errors));
+  assert.equal(r.report.violation, true);
+  assert.equal(r.report.withinPrefix, true);
+  assert.equal(r.report.prefixLength, 4);
+  assert.equal(r.report.witnessActions.length, 4);
+  assert.equal(r.report.steps.length, 5);
+  assert.equal(r.report.conflictId, 'P');
+  // 违约后剩余前缀行不参与归约，也不影响见证
+  const r2 = analyze(withPrefix(d, `${prefix}\nM1 #1 迟到确认`));
+  assert.equal(r2.ok, true);
+  assert.equal(r2.report.withinPrefix, true);
+  assert.equal(r2.report.witnessActions.length, 4);
+});
+
+test('前缀归约排除全部违约交织：从归约态穷尽得安全覆盖摘要', () => {
+  // 全局存在违约（M1 的新密钥准备可在写入前丢失 → 仍以旧纪元签发）；
+  // 现场前缀观察到新密钥已落盘、恢复、激活完成（8 步），剩余签发只能以新密钥。
+  const d = draft({
+    m1: mod('M1', { epoch: '0' }),
+    m2: mod('M2'),
+    prog: `prepare M1 ${NEW}
+recover M1
+activate M1
+issue M1 RO
+prepare M2 ${NEW}
+activate M2
+issue M2 RO`,
+  });
+  const base = analyze(d);
+  assert.equal(base.report.violation, true);
+
+  const prefix = [
+    'M1 #1 投递',
+    'M1 #1 落盘',
+    'M1 #1 确认',
+    'M1 #2 投递',
+    'M1 #2 落盘',
+    'M1 #2 确认',
+    'M1 #3 投递',
+    'M1 #3 落盘',
+  ].join('\n');
+  const r = analyze(withPrefix(d, prefix));
+  assert.equal(r.ok, true, JSON.stringify(r.errors));
+  assert.equal(r.report.violation, false);
+  assert.equal(r.report.prefixLength, 8);
+  assert.equal(r.report.withinPrefix, false);
+  // 归约态 M1 已为新纪元
+  assert.equal(r.report.terminalSnapshot.modules[0].epoch, 1);
+});
+
+test('前缀中的恢复与迟到/重复确认按既有持久化语义归约且幂等', () => {
+  // M1：prepare NEW 投递后写入前断电 → recover 落盘恢复在线 → 该指令迟到确认到达（无效）
+  const d = draft({
+    m1: mod('M1', { epoch: '0' }),
+    m2: mod('M2'),
+    prog: `prepare M1 ${NEW}
+recover M1
+activate M1`,
+  });
+  const prefix = [
+    'M1 #1 投递',
+    'M1 #1 断电前',
+    'M1 #2 投递',
+    'M1 #2 恢复',
+    'M1 #1 迟到确认',
+  ].join('\n');
+  const r = analyze(withPrefix(d, prefix));
+  assert.equal(r.ok, true, JSON.stringify(r.errors));
+  // 写入前断电：准备未落盘丢失；迟到确认幂等；M1 仍为旧纪元且无准备密钥
+  const snap = r.report.prefixSteps.at(-1);
+  assert.equal(snap.modules[0].prep, -1);
+  assert.equal(snap.modules[0].epoch, 0);
+});
+
+test('非法前缀：稳定定位首个不合法步骤并清除旧结论语义（返回前缀错误）', () => {
+  const d = draft({
+    m1: mod('M1'),
+    m2: mod('M2'),
+    prog: `prepare M1 ${OLD}
+activate M1`,
+  });
+
+  const cases = [
+    ['M1 #1 确认', /第 1 步/, /不可能发生|仅可记录/], // 未投递即确认
+    ['M1 #1 投递\nM1 #2 落盘', /第 2 步/, /在途槽位|FIFO/], // 槽位被 #1 占用
+    ['M2 #1 投递', /第 1 步/, /目标模块是/], // #1 不属于 M2
+    ['M1 #9 投递', /第 1 步/, /超出已录入指令范围/],
+    ['M1 #1 炸机', /第 1 步/, /未知事件/],
+    ['MX #1 投递', /第 1 步/, /不是已声明的两枚模块/],
+    ['M1 1 投递', /第 1 步/, /#指令序号/],
+    ['M1 #1 恢复', /第 1 步/, /只能引用 recover/],
+  ];
+  for (const [text, reStep, reMsg] of cases) {
+    const r = analyze(withPrefix(d, text));
+    assert.equal(r.ok, false, `前缀应被判非法：${text}`);
+    assert.equal(r.prefixInvalid, true);
+    assert.match(r.errors[0], reStep, `前缀：${text}`);
+    assert.match(r.errors[0], reMsg, `前缀：${text}`);
+  }
+});
+
+test('非法前缀：超过 8 步在第 9 步处拒绝，且不泄露任何旧结论字段', () => {
+  const d = draft({
+    m1: mod('M1'),
+    m2: mod('M2'),
+    prog: Array.from({ length: 9 }, (_, k) => `prepare M1 ${k % 2 ? NEW : OLD}`).join('\n'),
+  });
+  const prefix = Array.from({ length: 9 }, (_, k) => `M1 #${k + 1} 投递`).join('\n');
+  const r = analyze(withPrefix(d, prefix));
+  assert.equal(r.ok, false);
+  assert.match(r.errors[0], /第 9 步/);
+  assert.match(r.errors[0], /至多 8 步/);
+  assert.equal(r.report, undefined);
+});
+
+test('无前缀兼容性：留空、纯注释或缺字段时结论与原语义完全一致', () => {
+  const d = draft({
+    m1: mod('M1'),
+    m2: mod('M2'),
+    prog: `prepare M1 ${OLD}
+activate M1
+issue M1 Q
+prepare M2 ${NEW}
+activate M2
+issue M2 Q`,
+  });
+  const base = analyze(d);
+  for (const prefixText of ['', '   \n\t\n', '# 仅注释行\n', undefined]) {
+    const r = analyze(withPrefix(d, prefixText));
+    assert.equal(r.ok, true, JSON.stringify(r.errors));
+    assert.equal(r.report.violation, base.report.violation);
+    assert.equal(r.report.witnessActions.length, base.report.witnessActions.length);
+    assert.deepEqual(
+      r.report.witnessActions.map((a) => [a.m, a.i, a.kind]),
+      base.report.witnessActions.map((a) => [a.m, a.i, a.kind]),
+    );
+    assert.equal(r.report.prefixLength, undefined);
+  }
+});
+
+test('前缀不改变指令语义：现场记录不能当作新指令（仅归约，不新增队列项）', () => {
+  // 引用一条 recover 指令做事件但程序没有 recover 之外的副作用：
+  // 前缀步数远少于把不存在指令“发明”出来所需的迁移；越界引用直接非法。
+  const d = draft({
+    m1: mod('M1', { epoch: '0' }),
+    m2: mod('M2'),
+    prog: `prepare M1 ${NEW}
+recover M1`,
+  });
+  const r = analyze(withPrefix(d, 'M1 #3 投递'));
+  assert.equal(r.ok, false);
+  assert.match(r.errors[0], /超出已录入指令范围/);
+});

@@ -6,10 +6,12 @@ const els = {
   oldFp: $('#oldFp'),
   newFp: $('#newFp'),
   prog: $('#prog'),
+  prefix: $('#prefix'),
   run: $('#btn-run'),
   clear: $('#btn-clear'),
   stop: $('#btn-stop'),
   counter: $('#counter'),
+  prefixCounter: $('#prefix-counter'),
   progress: $('#progress'),
   errors: $('#errors'),
   result: $('#result'),
@@ -30,6 +32,7 @@ function collectDraft() {
     newFp: els.newFp.value,
     modules: moduleInputs(),
     instructionsText: els.prog.value,
+    prefixText: els.prefix.value,
   };
 }
 
@@ -51,6 +54,18 @@ function setRunning(running) {
 
 let worker = null;
 let runSeq = 0;
+let hasOutput = false;
+
+function markStale() {
+  // 密钥、初态、指令或现场前缀一经修改，旧结论/旧错误立即失效，不得继续展示
+  if (!hasOutput) return;
+  hasOutput = false;
+  runSeq++;
+  terminateWorker();
+  setRunning(false);
+  clearConclusion();
+  els.placeholder.textContent = '草稿自上次复核后已修改，旧结论已清除；点击“复核”获取新结论。';
+}
 
 function terminateWorker() {
   if (worker) {
@@ -94,6 +109,7 @@ function runReview() {
 
 function showErrors(errors) {
   clearConclusion();
+  hasOutput = true;
   const h = document.createElement('h3');
   h.textContent = `复核未通过：发现 ${errors.length} 处问题（已一次列出并清除旧结论）`;
   const ol = document.createElement('ol');
@@ -119,11 +135,13 @@ function renderResult(res) {
   if (report.violation) {
     root.appendChild(buildTrace(model, report));
   } else {
+    if (report.prefixLength) root.appendChild(buildPrefixTrace(model, report));
     root.appendChild(buildTerminal(model, report.terminalSnapshot));
     root.appendChild(buildEventCoverage(report.summary.eventCounts));
   }
   els.result.appendChild(root);
   els.result.hidden = false;
+  hasOutput = true;
 }
 
 function epochLabel(model, ep) {
@@ -163,6 +181,14 @@ function moduleStateHtml(model, ms) {
 
 function buildVerdict(model, report) {
   const div = document.createElement('div');
+  const pn = report.prefixLength || 0;
+  const prefixNote = pn
+    ? report.withinPrefix
+      ? `前缀归约至第 ${pn} 步即形成违约，完整见证即该现场前缀（不外推后续交织）。`
+      : report.violation
+        ? `前 ${pn} 步为已观察现场前缀（按持久化语义逐步归约），其后为从归约态穷尽所得的最短稳定排序反例。`
+        : `已先归约 ${pn} 步现场前缀，结论针对其双模块归约态之后尚未发生的全部交织。`
+    : '';
   if (report.violation) {
     div.className = 'verdict unsafe';
     const m = report.conflictKeys
@@ -173,12 +199,12 @@ function buildVerdict(model, report) {
       .join('，');
     div.innerHTML =
       `<div class="big">⚠ 发现违约：发布令 <span class="cid">${escapeHtml(report.conflictId)}</span> 被双模块以不同纪元密钥共同确认</div>
-       <div class="detail">${escapeHtml(m)}。以下交织动作数最短（${report.witnessActions.length} 步），同长度按（模块, 指令标识, 事件）稳定排序。</div>`;
+       <div class="detail">${escapeHtml(m)}。以下交织动作数最短（${report.witnessActions.length} 步），同长度按（模块, 指令标识, 事件）稳定排序。${prefixNote ? escapeHtml(prefixNote) : ''}</div>`;
   } else {
     div.className = 'verdict safe';
     div.innerHTML =
       '<div class="big">✓ 安全：穷尽全部保持控制端顺序的投递 / 断电 / 恢复交织，不存在跨纪元密钥共同确认</div>' +
-      `<div class="detail">已覆盖状态摘要见下，等价前缀已合并；所有断电恢复仅重放已落盘记录，迟到/重复确认不改变模块记录。</div>`;
+      `<div class="detail">${prefixNote ? escapeHtml(prefixNote) : ''}已覆盖状态摘要见下，等价前缀已合并；所有断电恢复仅重放已落盘记录，迟到/重复确认不改变模块记录。</div>`;
   }
   return div;
 }
@@ -218,9 +244,16 @@ function instructionLabel(model, idx) {
 
 function buildTrace(model, report) {
   const wrap = document.createElement('div');
+  const pn = report.prefixLength || 0;
   const head =
     '<h3 class="section">最短违约完整交织（逐步双模块状态）</h3>' +
-    `<div class="hint">动作序号从 1 开始；第 0 行为持久初态。指令编号 #n 即控制端发起顺序。</div>`;
+    `<div class="hint">动作序号从 1 开始；第 0 行为持久初态。指令编号 #n 即控制端发起顺序。` +
+    (pn
+      ? report.withinPrefix
+        ? `本见证全部 ${pn} 步均为现场事件前缀，前缀归约至此即形成违约。`
+        : `第 1–${pn} 行为现场前缀（底色标注），第 ${pn + 1} 步起为穷尽所得最短后续反例。`
+      : '') +
+    '</div>';
   const rows = report.steps
     .map((step, n) => {
       let actionCell = '<span class="epochnone">初态</span>';
@@ -228,10 +261,15 @@ function buildTrace(model, report) {
         const a = step.action;
         const cls = EVENT_CLS[a.kind] ?? '';
         const modName = model.moduleIds[a.module];
-        actionCell = `<div class="ev"><span class="kind ${cls}">${EVT_LABEL[a.kind]}</span></div>`
+        const prefixTag = n <= pn && pn > 0 ? '<span class="badge prefixbadge">现场前缀</span>' : '';
+        actionCell = `<div class="ev">${prefixTag}<span class="kind ${cls}">${EVT_LABEL[a.kind]}</span></div>`
           + `<div class="hint">${escapeHtml(modName)} · ${escapeHtml(instructionLabel(model, a.index))}</div>`;
       }
-      return `<tr class="${n === 0 ? 'step-initial' : ''}">
+      const rowCls = [
+        n === 0 ? 'step-initial' : '',
+        n >= 1 && n <= pn ? 'step-prefix' : '',
+      ].join(' ').trim();
+      return `<tr class="${rowCls}">
         <td class="stepno">${n}</td>
         <td>${actionCell}</td>
         <td>${moduleStateHtml(model, step.modules[0])}</td>
@@ -241,6 +279,36 @@ function buildTrace(model, report) {
     .join('');
   wrap.innerHTML =
     head +
+    `<table class="trace"><thead><tr>
+      <th>#</th><th>动作</th><th>${escapeHtml(model.moduleIds[0])} 状态</th><th>${escapeHtml(model.moduleIds[1])} 状态</th>
+    </tr></thead><tbody>${rows}</tbody></table>`;
+  return wrap;
+}
+
+function buildPrefixTrace(model, report) {
+  const wrap = document.createElement('div');
+  const pn = report.prefixLength;
+  wrap.innerHTML =
+    '<h3 class="section">现场前缀归约（逐步双模块状态）</h3>' +
+    `<div class="hint">以下 ${pn} 步按既有持久化语义从持久初态归约；此后尚未发生的交织已全部穷尽且安全。</div>`;
+  const rows = report.prefixSteps
+    .map((step, n) => {
+      let actionCell = '<span class="epochnone">初态</span>';
+      if (step.action) {
+        const a = step.action;
+        const cls = EVENT_CLS[a.kind] ?? '';
+        actionCell = `<div class="ev"><span class="badge prefixbadge">现场前缀</span><span class="kind ${cls}">${EVT_LABEL[a.kind]}</span></div>`
+          + `<div class="hint">${escapeHtml(model.moduleIds[a.module])} · ${escapeHtml(instructionLabel(model, a.index))}</div>`;
+      }
+      return `<tr class="${n === 0 ? 'step-initial' : 'step-prefix'}">
+        <td class="stepno">${n}</td>
+        <td>${actionCell}</td>
+        <td>${moduleStateHtml(model, step.modules[0])}</td>
+        <td>${moduleStateHtml(model, step.modules[1])}</td>
+      </tr>`;
+    })
+    .join('');
+  wrap.innerHTML +=
     `<table class="trace"><thead><tr>
       <th>#</th><th>动作</th><th>${escapeHtml(model.moduleIds[0])} 状态</th><th>${escapeHtml(model.moduleIds[1])} 状态</th>
     </tr></thead><tbody>${rows}</tbody></table>`;
@@ -290,9 +358,11 @@ els.clear.addEventListener('click', () => {
   terminateWorker();
   runSeq++;
   setRunning(false);
+  hasOutput = false;
   els.oldFp.value = '';
   els.newFp.value = '';
   els.prog.value = '';
+  els.prefix.value = '';
   document.querySelectorAll('.modpanel input[data-f]').forEach((i) => {
     if (i.tagName === 'INPUT') i.value = '';
   });
@@ -300,15 +370,31 @@ els.clear.addEventListener('click', () => {
     s.value = '-1';
   });
   els.counter.textContent = '';
+  els.prefixCounter.textContent = '';
   clearConclusion();
   els.placeholder.textContent = '尚未复核。穷举在浏览器 Worker 中执行，不占用页面交互。';
 });
 
 // 指令计数
+function countLines(text) {
+  return text.split(/\r?\n/).map((l) => l.trim()).filter((l) => l && !l.startsWith('#')).length;
+}
 function updateCounter() {
-  const n = els.prog.value.split(/\r?\n/).map((l) => l.trim()).filter((l) => l && !l.startsWith('#')).length;
+  const n = countLines(els.prog.value);
   els.counter.textContent = `已录入 ${n} / 16 条指令${n > 16 ? '（超出上限）' : ''}`;
   els.counter.style.color = n > 16 ? 'var(--bad)' : '';
 }
+function updatePrefixCounter() {
+  const n = countLines(els.prefix.value);
+  els.prefixCounter.textContent = `现场前缀 ${n} / 8 步${n > 8 ? '（超出上限）' : ''}`;
+  els.prefixCounter.style.color = n > 8 ? 'var(--bad)' : '';
+}
 els.prog.addEventListener('input', updateCounter);
+els.prefix.addEventListener('input', updatePrefixCounter);
 updateCounter();
+updatePrefixCounter();
+
+// 修改密钥、初态、指令或现场前缀后，不得继续显示旧结果：首次编辑即清除结论区
+for (const el of document.querySelectorAll('#card-input input, #card-input select, #card-input textarea')) {
+  el.addEventListener('input', markStale);
+}

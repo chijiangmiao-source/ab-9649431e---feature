@@ -235,6 +235,165 @@ export function parseModel(raw) {
   };
 }
 
+// ---------- 现场事件前缀（至多 8 步的已观察事件，不是新的控制端指令） ----------
+//
+// 每行一步：<模块标识> #<指令序号> <事件>
+// 指令序号即控制端发起顺序（从 1 起）；事件仅限当前状态下确实可发生的迁移。
+// 归约严格复用既有持久化语义（transitions）：从持久初态逐步重放，首个不合法步
+// 即唯一定位；若前缀自身已形成违约，则完整见证从该前缀开始展示。
+
+const PREFIX_EVT_ALIASES = Object.freeze({
+  投递: EVT.DELIVER,
+  落盘: EVT.WRITE,
+  持久写入: EVT.WRITE,
+  确认: EVT.ACK,
+  断电前: EVT.FAULT_PRE,
+  写入前断电: EVT.FAULT_PRE,
+  断电后: EVT.FAULT_POST,
+  写入后断电: EVT.FAULT_POST,
+  断电确认: EVT.FAULT_ACK,
+  确认后断电: EVT.FAULT_ACK,
+  迟到确认: EVT.DUP_ACK,
+  重复确认: EVT.DUP_ACK,
+});
+
+export const PREFIX_MAX_STEPS = 8;
+
+// 返回 {blank:true}（无有效行）、{error:{step,lineNo,message}} 或
+// {actions,steps,state,violationIndex,remaining}
+function reducePrefix(model, text) {
+  const src = String(text ?? '').split(/\r?\n/);
+  const lines = [];
+  src.forEach((raw, k) => {
+    const line = raw.trim();
+    if (line && !line.startsWith('#')) lines.push({ lineNo: k + 1, line });
+  });
+  if (!lines.length) return { blank: true };
+  if (lines.length > PREFIX_MAX_STEPS) {
+    const x = lines[PREFIX_MAX_STEPS];
+    return {
+      error: {
+        step: PREFIX_MAX_STEPS + 1,
+        lineNo: x.lineNo,
+        message:
+          `现场前缀第 ${PREFIX_MAX_STEPS + 1} 步（第 ${x.lineNo} 行“${x.line}”）：` +
+          `现场前缀至多 ${PREFIX_MAX_STEPS} 步，超出部分不予归约（现场记录不能追加为新指令）。`,
+      },
+    };
+  }
+
+  let s = initialState(model);
+  if (isViolation(model, s) !== null) {
+    const x = lines[0];
+    return {
+      error: {
+        step: 1,
+        lineNo: x.lineNo,
+        message:
+          `现场前缀第 1 步（第 ${x.lineNo} 行“${x.line}”）：持久初态已构成零动作违约，` +
+          '不存在可继续归约的现场前缀。',
+      },
+    };
+  }
+
+  const actions = [];
+  const steps = [snapshot(model, s, null)];
+  for (let k = 0; k < lines.length; k++) {
+    const { lineNo, line } = lines[k];
+    const step = k + 1;
+    const at = `现场前缀第 ${step} 步（第 ${lineNo} 行“${line}”）`;
+    const fail = (msg) => ({ error: { step, lineNo, message: `${at}：${msg}` } });
+
+    const tokens = line.split(/\s+/);
+    const [tokM, tokI, tokE, ...rest] = tokens;
+    const m = model.moduleIds.indexOf(tokM);
+    if (m < 0) return fail(`模块“${tokM ?? ''}”不是已声明的两枚模块之一。`);
+
+    const im = (tokI ?? '').match(/^#(\d+)$/);
+    if (!im) return fail('第二步必须为“#指令序号”（序号即控制端发起顺序，从 1 起）。');
+    const n = Number(im[1]);
+    if (n < 1 || n > model.instructions.length)
+      return fail(`指令序号 #${n} 超出已录入指令范围（1…${model.instructions.length}）。`);
+    const i = n - 1;
+
+    let kind = PREFIX_EVT_ALIASES[tokE];
+    if (kind === undefined && tokE === '恢复' && model.instructions[i].op !== 'recover')
+      return fail(`“恢复”只能引用 recover 指令；#${n} 是${EVT_VERB[model.instructions[i].op]}指令。`);
+    if (tokE === '恢复' && model.instructions[i].op === 'recover') kind = EVT.WRITE;
+    if (kind === undefined)
+      return fail(
+        `未知事件“${tokE ?? ''}”，应为 投递/落盘/确认/断电前/断电后/断电确认/迟到确认 之一。`,
+      );
+    if (rest.length)
+      return fail(`多余内容“${rest.join(' ')}”，每步格式必须为：模块 #指令序号 事件。`);
+
+    const ins = model.instructions[i];
+    if (ins.target !== m)
+      return fail(
+        `指令 #${n} 的目标模块是“${model.moduleIds[ins.target]}”，不属于“${model.moduleIds[m]}”；` +
+        '现场记录必须精确引用当前模块在途的指令。',
+      );
+
+    const ts = transitions(s, model);
+    const t = ts.find((x) => x.m === m && x.i === i && x.kind === kind);
+    if (!t) return fail(illegalReason(model, s, m, i, kind));
+
+    actions.push({ m, i, kind, lineNo });
+    s = t.ns;
+    steps.push(snapshot(model, s, { m, i, kind }));
+    const v = isViolation(model, s);
+    if (v !== null) {
+      return { actions, steps, state: s, violationIndex: step, idIdx: v, remaining: lines.length - step };
+    }
+  }
+  return { blank: false, actions, steps, state: s, violationIndex: null, remaining: 0 };
+}
+
+function illegalReason(model, s, m, i, kind) {
+  const here = transitions(s, model).filter((t) => t.m === m && t.i === i);
+  const pos = model.queues[m].indexOf(i);
+  if (!here.length) {
+    if (pos < s.h[m])
+      return `指令 #${i + 1} 在该模块上已处理完毕，不能重复其生命周期事件；` +
+        '恢复后才观察到的确认须记为“迟到确认”。';
+    if (s.infl[m])
+      return `该模块在途槽位正被指令 #${s.infl[m].i + 1} 占用，FIFO 顺序下 #${i + 1} 此刻不能投递。`;
+    return `指令 #${i + 1} 此刻不在该模块 FIFO 队首（前序指令尚未走完），不能跳过发起顺序。`;
+  }
+  if (kind === EVT.DUP_ACK)
+    return '该指令此刻没有可观察的迟到/重复确认：仅当其确认在断电后滞留、且模块已恢复在线时才可记录“迟到确认”。';
+  const allow = here.map((t) => EVT_LABEL[t.kind]).join('、');
+  return `事件“${EVT_LABEL[kind]}”在当前双模块状态下不可能发生；` +
+    `#${i + 1}（${model.instructions[i].text}）此刻仅可记录：${allow}。`;
+}
+
+function prefixBreachReport(model, pf) {
+  const last = pf.steps[pf.steps.length - 1];
+  const conflictKeys = [0, 1].map((m) => ({
+    module: m,
+    bits: last.modules[m].confirmed.find((x) => x.idIdx === pf.idIdx)?.bits ?? 0,
+  }));
+  return {
+    violation: true,
+    conflictId: model.idTable[pf.idIdx],
+    conflictKeys,
+    witnessActions: pf.actions.map((a) => ({ m: a.m, kind: a.kind, i: a.i })),
+    steps: pf.steps,
+    summary: {
+      visited: 1,
+      depth: 0,
+      merges: 0,
+      terminals: 0,
+      distinctCanon: 1,
+      eventCounts: new Array(7).fill(0),
+    },
+    prefixLength: pf.actions.length,
+    prefixSteps: pf.steps,
+    withinPrefix: true,
+    prefixIgnored: pf.remaining,
+  };
+}
+
 // ---------- 规范状态与穷举搜索 ----------
 
 function canonKey(c) {
@@ -450,8 +609,9 @@ function chainLess(parent, getParent, k1, k2) {
 }
 
 // onProgress({visited, depth, merges}) 可周期性返回 true 请求停止（UI 取消）。
-export function explore(model, onProgress) {
-  const start = initialState(model);
+// startOverride：合法现场前缀归约所得双模块状态，从此状态继续穷尽尚未发生的交织。
+export function explore(model, onProgress, startOverride = null) {
+  const start = startOverride ?? initialState(model);
   const k0 = stateKey(start);
   const states = new Map([[k0, start]]);
   const parent = new Map([[k0, { p: null }]]);
@@ -606,23 +766,50 @@ function snapshot(model, s, action) {
 export function analyze(raw, onProgress) {
   const parsed = parseModel(raw);
   if (parsed.errors) return { ok: false, errors: parsed.errors };
-  const report = explore(parsed.model, onProgress);
+
+  // 现场前缀先按既有持久化语义逐步归约；它是观察记录而非新指令
+  const pf = reducePrefix(parsed.model, raw.prefixText);
+  if (pf.error) return { ok: false, errors: [pf.error.message], prefixInvalid: true };
+
+  if (!pf.blank && pf.violationIndex !== null) {
+    // 前缀本身已形成违约：完整见证从该前缀开始，不再外推尚未发生的交织
+    const report = prefixBreachReport(parsed.model, pf);
+    return { ok: true, model: publicModel(parsed.model), report };
+  }
+
+  const report = explore(parsed.model, onProgress, pf.blank ? null : pf.state);
   if (report.cancelled) return { ok: false, cancelled: true };
+
+  if (!pf.blank && report.violation) {
+    // 见证 = 现场前缀 + 从归约态穷尽得到的最短稳定排序后续反例
+    report.witnessActions = [
+      ...pf.actions.map((a) => ({ m: a.m, kind: a.kind, i: a.i })),
+      ...report.witnessActions,
+    ];
+    report.steps = [...pf.steps, ...report.steps.slice(1)];
+    report.prefixLength = pf.actions.length;
+    report.prefixSteps = pf.steps;
+    report.withinPrefix = false;
+  } else if (!pf.blank) {
+    report.prefixLength = pf.actions.length;
+    report.prefixSteps = pf.steps;
+    report.withinPrefix = false;
+  }
+  return { ok: true, model: publicModel(parsed.model), report };
+}
+
+function publicModel(parsed) {
   return {
-    ok: true,
-    model: {
-      keys: parsed.model.keys,
-      moduleIds: parsed.model.moduleIds,
-      idTable: parsed.model.idTable,
-      instructions: parsed.model.instructions.map((x) => ({
-        idx: x.idx,
-        lineNo: x.lineNo,
-        op: x.op,
-        target: x.target,
-        arg: x.arg,
-        text: x.text,
-      })),
-    },
-    report,
+    keys: parsed.keys,
+    moduleIds: parsed.moduleIds,
+    idTable: parsed.idTable,
+    instructions: parsed.instructions.map((x) => ({
+      idx: x.idx,
+      lineNo: x.lineNo,
+      op: x.op,
+      target: x.target,
+      arg: x.arg,
+      text: x.text,
+    })),
   };
 }
