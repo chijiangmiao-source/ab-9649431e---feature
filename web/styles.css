@@ -130,6 +130,8 @@ td.stepno { text-align: right; color: var(--muted); width: 42px; }
 .badge.both { background: #3a2140; color: #d9a5e8; }
 .badge.down { background: #3d2b2b; color: #e8a0a0; }
 .badge.online { background: #1c3324; color: #9fe0b6; }
+.badge.live { background: #173a3a; color: #7ad0e0; border: 1px solid #24555c; }
+tr.step-prefix td { background: rgba(74, 168, 255, 0.06); }
 .conf { margin-top: 4px; }
 .conf .cid { color: var(--bad); font-weight: 700; }
 

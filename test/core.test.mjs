@@ -6,14 +6,16 @@ import { analyze, parseModel, EVT, EVT as E, NONE } from '../src/core.mjs';
 const OLD = 'FP-OLD-0001';
 const NEW = 'FP-NEW-0002';
 
-function draft({ m1 = {}, m2 = {}, prog = '', oldFp = OLD, newFp = NEW }) {
+function draft({ m1 = {}, m2 = {}, prog = '', oldFp = OLD, newFp = NEW, prefix = undefined }) {
   const mk = (over) => ({
     id: over.id ?? '',
     epoch: over.epoch ?? '-1',
     prep: over.prep ?? '-1',
     confirmed: over.confirmed ?? '',
   });
-  return { oldFp, newFp, modules: [mk(m1), mk(m2)], instructionsText: prog };
+  const d = { oldFp, newFp, modules: [mk(m1), mk(m2)], instructionsText: prog };
+  if (prefix !== undefined) d.prefixText = prefix;
+  return d;
 }
 
 const mod = (id, over = {}) => ({ id, ...over });
@@ -588,4 +590,277 @@ issue M2 Z1`,
   assert.equal(r.report.violation, false);
   // 指令物理行号保留：#5(2) 签发实际在第 5 行
   assert.equal(r.model.instructions[2].lineNo, 5);
+});
+
+// ---------- 现场事件前缀 ----------
+
+test('现场前缀：归约已观察事件后，最短后续见证自前缀起完整展示', () => {
+  const prog = `
+prepare M1 ${OLD}
+activate M1
+issue M1 ORD-9
+prepare M1 ${NEW}
+activate M1
+prepare M2 ${NEW}
+activate M2
+issue M2 ORD-9
+`;
+  const noPrefix = analyze(draft({ m1: mod('M1'), m2: mod('M2'), prog }));
+  assert.equal(noPrefix.report.violation, true);
+  assert.equal(noPrefix.report.witnessActions.length, 16);
+
+  const d = draft({
+    m1: mod('M1'),
+    m2: mod('M2'),
+    prog,
+    prefix: `投递 M1 #0
+落盘 M1 #0
+确认 M1 #0`,
+  });
+  const r = analyze(d);
+  assert.equal(r.ok, true, JSON.stringify(r.errors));
+  assert.equal(r.report.violation, true);
+  assert.equal(r.report.conflictId, 'ORD-9');
+  assert.equal(r.report.prefixLength, 3);
+  // 完整见证 = 前缀 3 步 + 最短后续 13 步 = 无前缀最短见证 16 步
+  assert.equal(r.report.witnessActions.length, 16);
+  assert.deepEqual(
+    r.report.witnessActions.slice(0, 3).map((a) => a.kind),
+    [EVT.DELIVER, EVT.WRITE, EVT.ACK],
+  );
+  assert.ok(r.report.witnessActions.slice(0, 3).every((a) => a.prefix === true));
+  assert.ok(r.report.witnessActions.slice(3).every((a) => a.prefix === false));
+  // 该前缀正是稳定排序最短链的前三步：带前缀的完整见证与无前缀最短见证逐步一致
+  assert.deepEqual(
+    r.report.witnessActions.map((a) => [a.m, a.i, a.kind]),
+    noPrefix.report.witnessActions.map((a) => [a.m, a.i, a.kind]),
+  );
+  assert.equal(r.report.steps.length, 17);
+  // 前缀归约后的双模块状态快照：#0（准备旧密钥）已落盘确认
+  assert.equal(r.report.startSnapshot.modules[0].prep, 0);
+  assert.equal(r.report.startSnapshot.modules[0].epoch, -1);
+  assert.equal(r.report.startSnapshot.modules[0].mode, 'online');
+  assert.equal(r.model.prefix.length, 3);
+});
+
+test('现场前缀：前缀归约完成时即形成违约，见证仅含前缀步骤', () => {
+  const d = draft({
+    m1: mod('M1', { epoch: '0' }),
+    m2: mod('M2', { epoch: '1' }),
+    prog: `issue M1 X
+issue M2 X`,
+    prefix: `投递 M1 #0
+落盘 M1 #0
+投递 M2 #1
+落盘 M2 #1`,
+  });
+  const r = analyze(d);
+  assert.equal(r.ok, true, JSON.stringify(r.errors));
+  assert.equal(r.report.violation, true);
+  assert.equal(r.report.conflictId, 'X');
+  assert.equal(r.report.prefixLength, 4);
+  assert.equal(r.report.witnessActions.length, 4);
+  assert.ok(r.report.witnessActions.every((a) => a.prefix === true));
+  assert.equal(r.report.steps.length, 5);
+  const last = r.report.steps.at(-1);
+  assert.deepEqual(
+    last.modules.map((m) => m.confirmed[0]?.bits),
+    [1, 2],
+  );
+});
+
+test('现场前缀：不可能发生的前缀稳定定位首个不合法步骤', () => {
+  const d = draft({
+    m1: mod('M1'),
+    m2: mod('M2'),
+    prog: `prepare M1 ${NEW}
+activate M1
+issue M1 Z
+prepare M2 ${NEW}
+activate M2
+issue M2 Z`,
+    prefix: `投递 M1 #0
+确认 M1 #0
+断电 M1 #0`,
+  });
+  const r = analyze(d);
+  assert.equal(r.ok, false);
+  assert.equal(r.errors.length, 1, JSON.stringify(r.errors));
+  assert.match(r.errors[0], /现场前缀第 2 步/);
+  assert.match(r.errors[0], /尚未落盘/);
+  assert.doesNotMatch(r.errors[0], /第 3 步/);
+});
+
+test('现场前缀：断电按在途阶段归约，恢复仅重放已落盘记录', () => {
+  const prog = `prepare M1 ${NEW}
+recover M1
+activate M1
+issue M1 RO
+prepare M2 ${NEW}
+activate M2
+issue M2 RO`;
+  // 写入前断电：新密钥准备未落盘即丢失，恢复后无可重放
+  const lost = analyze(
+    draft({
+      m1: mod('M1', { epoch: '0' }),
+      m2: mod('M2'),
+      prog,
+      prefix: `投递 M1 #0
+断电 M1 #0
+投递 M1 #1
+恢复 M1 #1`,
+    }),
+  );
+  assert.equal(lost.ok, true, JSON.stringify(lost.errors));
+  assert.equal(lost.report.prefixLength, 4);
+  assert.equal(lost.report.prefixActions[1].kind, EVT.FAULT_PRE);
+  const snapLost = lost.report.startSnapshot.modules[0];
+  assert.equal(snapLost.mode, 'online');
+  assert.equal(snapLost.prep, -1); // 未落盘的准备已丢失
+  assert.equal(snapLost.epoch, 0);
+  // M1 只能以旧密钥签发，M2 以新密钥 → 剩余交织仍达违约
+  assert.equal(lost.report.violation, true);
+  assert.equal(lost.report.steps.at(-1).modules[0].epoch, 0);
+
+  // 写入后确认前断电：准备已落盘，恢复重放后仍可用于激活
+  const kept = analyze(
+    draft({
+      m1: mod('M1', { epoch: '0' }),
+      m2: mod('M2'),
+      prog,
+      prefix: `投递 M1 #0
+落盘 M1 #0
+断电 M1 #0
+投递 M1 #1
+恢复 M1 #1`,
+    }),
+  );
+  assert.equal(kept.ok, true, JSON.stringify(kept.errors));
+  assert.equal(kept.report.prefixLength, 5);
+  assert.equal(kept.report.prefixActions[2].kind, EVT.FAULT_POST);
+  const snapKept = kept.report.startSnapshot.modules[0];
+  assert.equal(snapKept.mode, 'online');
+  assert.equal(snapKept.prep, 1); // 已落盘的准备被重放保留
+  // 双模块最终均以新密钥确认 → 安全
+  assert.equal(kept.report.violation, false);
+});
+
+test('现场前缀：恢复后到达的迟到确认可作为「确认」观察', () => {
+  const d = draft({
+    m1: mod('M1', { epoch: '0' }),
+    m2: mod('M2'),
+    prog: `prepare M1 ${NEW}
+recover M1
+activate M1
+issue M1 W
+prepare M2 ${NEW}
+activate M2
+issue M2 W`,
+    prefix: `投递 M1 #0
+落盘 M1 #0
+断电 M1 #0
+投递 M1 #1
+恢复 M1 #1
+确认 M1 #0`,
+  });
+  const r = analyze(d);
+  assert.equal(r.ok, true, JSON.stringify(r.errors));
+  assert.equal(r.report.prefixLength, 6);
+  // 第 6 步归约为恢复后到达的迟到/重复确认（幂等，不改变规范状态）
+  assert.equal(r.report.prefixActions[5].kind, EVT.DUP_ACK);
+  assert.equal(r.report.startSnapshot.modules[0].mode, 'online');
+  assert.equal(r.report.violation, false);
+});
+
+test('现场前缀：未填写前缀时结论与指令语义完全不变', () => {
+  const prog = `prepare M1 ${OLD}
+activate M1
+issue M1 ORD-9
+prepare M1 ${NEW}
+activate M1
+prepare M2 ${NEW}
+activate M2
+issue M2 ORD-9`;
+  const a = analyze(draft({ m1: mod('M1'), m2: mod('M2'), prog }));
+  const b = analyze(draft({ m1: mod('M1'), m2: mod('M2'), prog, prefix: '' }));
+  const c = analyze(draft({ m1: mod('M1'), m2: mod('M2'), prog, prefix: '\n# 仅注释\n  \n' }));
+  assert.deepEqual(b, a);
+  assert.deepEqual(c, a);
+  assert.equal(a.report.prefixLength, 0);
+  assert.equal(a.report.startSnapshot, undefined);
+  assert.equal(a.report.prefixActions, undefined);
+});
+
+test('现场前缀：格式与引用错误随其他校验一次性指出', () => {
+  const d = draft({
+    m1: mod('M1'),
+    m2: mod('M2'),
+    prog: `prepare M1 ${NEW}
+recover M1`,
+    prefix: `围观 M1 #0
+投递 M9 #0
+投递 M1
+投递 M1 #9
+落盘 M2 #0
+恢复 M1 #0
+投递 M1 #0 extra
+落盘 M1 #1`,
+  });
+  const r = analyze(d);
+  assert.equal(r.ok, false);
+  const msg = r.errors.join('\n');
+  const expected = [
+    /未知事件类型“围观”/,
+    /模块“M9”不是已声明的两枚模块之一/,
+    /缺少指令编号/,
+    /指令 #9 不存在（当前共 2 条指令）/,
+    /与所引模块“M2”不符/,
+    /不是恢复指令/,
+    /多余内容/,
+    /落盘重放应观察为「恢复」/,
+  ];
+  for (const re of expected) assert.match(msg, re, `缺少错误：${re}；实际错误：\n${msg}`);
+  assert.ok(r.errors.length >= expected.length, `实际仅 ${r.errors.length} 条：\n${msg}`);
+  // 每条前缀错误均稳定标注步骤序号
+  assert.ok((msg.match(/现场前缀第 \d+ 步/g) || []).length >= expected.length);
+});
+
+test('现场前缀：超过 8 步不予受理', () => {
+  const d = draft({
+    m1: mod('M1'),
+    m2: mod('M2'),
+    prog: 'issue M1 X\nissue M2 X',
+    prefix: Array.from({ length: 9 }, () => '投递 M1 #0').join('\n'),
+  });
+  const r = analyze(d);
+  assert.equal(r.ok, false);
+  assert.match(r.errors.join('\n'), /超过上限 8 步/);
+});
+
+test('现场前缀：归约后保留安全覆盖摘要（断电未恢复，剩余交织安全）', () => {
+  const d = draft({
+    m1: mod('M1'),
+    m2: mod('M2'),
+    prog: `prepare M1 ${NEW}
+activate M1
+issue M1 X
+prepare M2 ${NEW}
+activate M2
+issue M2 X`,
+    prefix: `投递 M1 #0
+落盘 M1 #0
+断电 M1 #0`,
+  });
+  const r = analyze(d);
+  assert.equal(r.ok, true, JSON.stringify(r.errors));
+  assert.equal(r.report.violation, false);
+  assert.equal(r.report.prefixLength, 3);
+  assert.equal(r.report.prefixActions[2].kind, EVT.FAULT_POST);
+  const m0 = r.report.startSnapshot.modules[0];
+  assert.equal(m0.mode, 'down');
+  assert.equal(m0.prep, 1); // 已落盘的准备保持有效
+  // 安全覆盖摘要与代表性终态照常给出（针对前缀归约后的剩余交织）
+  assert.ok(r.report.summary.visited > 0);
+  assert.ok(r.report.summary.terminals >= 1);
+  assert.ok(r.report.terminalSnapshot);
 });

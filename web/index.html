@@ -83,6 +83,17 @@ placeholder="prepare M1 FP-OLD-7F3A&#10;activate M1&#10;issue M1 ORD-1&#10;recov
         初态指纹处可直接填写完整指纹，也可写 <code>旧</code>/<code>新</code> 代指当前声明的指纹。
       </p>
 
+      <label class="wide">现场事件前缀（可选，每行一步，至多 8 步）
+        <textarea id="prefix" rows="4" spellcheck="false"
+placeholder="投递 M1 #0&#10;落盘 M1 #0&#10;断电 M1 #0&#10;投递 M1 #1&#10;恢复 M1 #1"></textarea>
+      </label>
+      <p class="hint">
+        每步形如 <code>投递 M1 #0</code>：事件（<code>投递/落盘/确认/断电/恢复</code>）＋模块标识＋指令编号
+        （<code>#n</code> 即上方指令的控制端发起顺序，从 #0 起）。前缀是已观察到的现场记录，
+        不作为新的控制端指令：复核先按既有持久化语义逐步归约前缀（不可能的步骤会被首个定位），
+        再从所得双模块状态穷尽尚未发生的交织。
+      </p>
+
       <div class="actions">
         <button id="btn-run" class="primary" type="button">复核</button>
         <button id="btn-clear" type="button">清空草稿与结论</button>

@@ -55,6 +55,44 @@ const OP_ALIASES = Object.freeze({
   恢复: 'recover',
 });
 
+// ---------- 现场事件前缀 ----------
+//
+// 安全工程师录入指令后，可追加至多 8 步已观察到的现场事件（每行一步）：
+//   投递 <模块> #n   指令 #n 已投递到模块
+//   落盘 <模块> #n   指令 #n 已完成持久写入（恢复指令的落盘重放请用「恢复」）
+//   确认 <模块> #n   指令 #n 的确认已到达（含恢复后到达的迟到/重复确认）
+//   断电 <模块> #n   指令 #n 在途期间断电（按所处阶段归约为写入前 / 写入后确认前断电）
+//   恢复 <模块> #n   恢复指令 #n 落盘重放，模块回到在线
+// 前缀是现场记录而非新的控制端指令：复核先按既有持久化语义逐步归约前缀，
+// 再从所得双模块状态继续穷尽尚未发生的交织。
+
+export const PREFIX_LIMIT = 8;
+
+const PREFIX_EVT_ALIASES = Object.freeze({
+  deliver: 'deliver',
+  投递: 'deliver',
+  write: 'write',
+  persist: 'write',
+  落盘: 'write',
+  写入: 'write',
+  ack: 'ack',
+  确认: 'ack',
+  fault: 'fault',
+  powerloss: 'fault',
+  断电: 'fault',
+  recover: 'recover',
+  resume: 'recover',
+  恢复: 'recover',
+});
+
+export const PREFIX_EVT_LABEL = Object.freeze({
+  deliver: '投递',
+  write: '落盘',
+  ack: '确认',
+  fault: '断电',
+  recover: '恢复',
+});
+
 // ---------- 输入解析与一次性校验（全部错误一次指出） ----------
 
 // raw: {oldFp, newFp, modules:[{id, epoch:'-1'|'0'|'1', prep:'-1'|'0'|'1', confirmed}],
@@ -211,6 +249,73 @@ export function parseModel(raw) {
     seenTarget[ins.target] = true;
   }
 
+  // 现场事件前缀（每行一步，至多 8 步）：引用已录入指令的编号 #n（控制端发起顺序，从 #0 计）
+  const prefix = [];
+  let pLineNo = 0;
+  let pStepNo = 0;
+  for (const rawLine of (raw.prefixText ?? '').split(/\r?\n/)) {
+    pLineNo += 1;
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) continue; // 空行与 # 注释行不计入前缀步骤
+    pStepNo += 1;
+    if (pStepNo > PREFIX_LIMIT) {
+      errors.push(`现场前缀第 ${pLineNo} 行：前缀步数超过上限 ${PREFIX_LIMIT} 步，超出部分不予受理。`);
+      break;
+    }
+    const tokens = line.split(/\s+/);
+    const where = `现场前缀第 ${pStepNo} 步（第 ${pLineNo} 行）“${line}”`;
+    const evtTok = tokens[0] ?? '';
+    const evt = PREFIX_EVT_ALIASES[evtTok.toLowerCase?.() ?? evtTok] ?? PREFIX_EVT_ALIASES[evtTok];
+    if (!evt) {
+      errors.push(`${where}：未知事件类型“${evtTok}”，应为 投递/落盘/确认/断电/恢复。`);
+      continue;
+    }
+    const targetTok = tokens[1] ?? '';
+    if (!targetTok) {
+      errors.push(`${where}：缺少模块标识。`);
+      continue;
+    }
+    const mi = targetIndex(targetTok);
+    if (mi < 0) {
+      errors.push(`${where}：模块“${targetTok}”不是已声明的两枚模块之一。`);
+      continue;
+    }
+    const refTok = tokens[2] ?? '';
+    if (!refTok) {
+      errors.push(`${where}：缺少指令编号（形如 #3，按控制端发起顺序从 #0 计）。`);
+      continue;
+    }
+    if (tokens[3] !== undefined) {
+      errors.push(`${where}：格式应为 <事件> <模块> #<指令编号>，存在多余内容。`);
+      continue;
+    }
+    if (!/^#?\d+$/.test(refTok)) {
+      errors.push(`${where}：指令编号“${refTok}”非法，应为 #数字。`);
+      continue;
+    }
+    const i = Number(refTok.replace('#', ''));
+    if (i >= instructions.length) {
+      errors.push(`${where}：指令 #${i} 不存在（当前共 ${instructions.length} 条指令）。`);
+      continue;
+    }
+    const ins = instructions[i];
+    if (ins.target !== mi) {
+      errors.push(
+        `${where}：指令 #${i} 的目标是模块“${ids[ins.target]}”，与所引模块“${targetTok}”不符。`,
+      );
+      continue;
+    }
+    if (evt === 'recover' && ins.op !== 'recover') {
+      errors.push(`${where}：指令 #${i} 不是恢复指令，无法观察「恢复」。`);
+      continue;
+    }
+    if (evt === 'write' && ins.op === 'recover') {
+      errors.push(`${where}：指令 #${i} 是恢复指令，其落盘重放应观察为「恢复」。`);
+      continue;
+    }
+    prefix.push({ evt, m: mi, i, lineNo: pLineNo, text: line });
+  }
+
   if (errors.length) return { errors };
 
   // 统一补齐每个模块的已确认位向量
@@ -226,6 +331,7 @@ export function parseModel(raw) {
       moduleIds: [ids[0], ids[1]],
       inits,
       instructions,
+      prefix,
       idTable,
       queues: [
         instructions.filter((x) => x.target === 0).map((x) => x.idx),
@@ -416,6 +522,76 @@ function transitions(s, model) {
   });
 }
 
+// ---------- 现场前缀归约 ----------
+
+// 逐步回放已观察的现场事件：每步必须在当前双模块状态下精确可发生；
+// 全部归约后返回所得状态与已解析动作序列（供见证自前缀起展示）。
+// 任一步不可能发生时，稳定定位首个不合法步骤并给出原因。
+function reducePrefix(model, steps) {
+  let s = initialState(model);
+  const actions = [];
+  for (let k = 0; k < steps.length; k++) {
+    const st = steps[k];
+    const ins = model.instructions[st.i];
+    // transitions 已按 (模块, 指令序号, 事件) 稳定排序：断电在确认前/后均可时
+    // 确定性取 FAULT_POST（两者规范效果一致）；确认优先匹配准时 ACK，
+    // 否则匹配恢复后到达的迟到/重复确认（DUP_ACK，幂等）。
+    const match = transitions(s, model).find((t) => {
+      if (t.m !== st.m || t.i !== st.i) return false;
+      switch (st.evt) {
+        case 'deliver':
+          return t.kind === EVT.DELIVER;
+        case 'write':
+          return t.kind === EVT.WRITE && ins.op !== 'recover';
+        case 'recover':
+          return t.kind === EVT.WRITE && ins.op === 'recover';
+        case 'ack':
+          return t.kind === EVT.ACK || t.kind === EVT.DUP_ACK;
+        case 'fault':
+          return t.kind === EVT.FAULT_PRE || t.kind === EVT.FAULT_POST || t.kind === EVT.FAULT_ACK;
+      }
+      return false;
+    });
+    if (!match) {
+      return {
+        error: `现场前缀第 ${k + 1} 步「${st.text}」不可能发生：${prefixStepReason(model, s, st)}。`,
+      };
+    }
+    actions.push({ m: match.m, i: match.i, kind: match.kind, prefix: true });
+    s = match.ns;
+  }
+  return { state: s, actions };
+}
+
+// 首个不合法前缀步骤的原因（仅在当前状态下无任何匹配迁移时调用）
+function prefixStepReason(model, s, st) {
+  const m = st.m;
+  const i = st.i;
+  const ins = model.instructions[i];
+  const mid = model.moduleIds[m];
+  const q = model.queues[m];
+  const pos = q.indexOf(i);
+  const inf = s.infl[m];
+  if (st.evt === 'write' && ins.op === 'recover')
+    return `指令 #${i} 是恢复指令，其落盘重放应观察为「恢复」`;
+  if (inf && inf.i === i) {
+    if (st.evt === 'deliver') return `指令 #${i} 已投递，无法重复投递`;
+    if (inf.ph === 0) {
+      if (st.evt === 'ack') return `指令 #${i} 已投递但尚未落盘，无法确认`;
+      return `模块“${mid}”处于断电状态，仅恢复指令可落盘`;
+    }
+    return `指令 #${i} 已落盘，无法重复落盘`;
+  }
+  if (inf) return `模块“${mid}”的在途槽位正被指令 #${inf.i} 占用`;
+  if (st.evt === 'ack' && s.late[m].includes(i))
+    return `指令 #${i} 的确认属迟到/重复确认，需模块“${mid}”恢复在线后到达`;
+  if (pos < s.h[m]) return `指令 #${i} 已处理完毕，不在在途位置，无法再次观察`;
+  if (pos > s.h[m])
+    return `指令 #${i} 尚未到达模块“${mid}”队首（在前指令 #${q[s.h[m]]} 尚未投递）`;
+  if (st.evt === 'fault') return `指令 #${i} 尚未投递，模块“${mid}”当前无在途指令可断电`;
+  return `指令 #${i} 尚未投递`;
+}
+
 function isViolation(model, s) {
   // 同标识发布被两模块以不同纪元密钥确认（各自确认位掩码非空且不一致）
   const a = s.canon[0].bits;
@@ -450,8 +626,11 @@ function chainLess(parent, getParent, k1, k2) {
 }
 
 // onProgress({visited, depth, merges}) 可周期性返回 true 请求停止（UI 取消）。
-export function explore(model, onProgress) {
-  const start = initialState(model);
+// opts.startState / opts.prefixActions：现场前缀归约产物——从归约后状态继续穷尽
+// 剩余交织；违约见证 = 前缀 + 最短后续，自初态起逐步展示。
+export function explore(model, onProgress, opts = {}) {
+  const prefixActions = opts.prefixActions ?? [];
+  const start = opts.startState ?? initialState(model);
   const k0 = stateKey(start);
   const states = new Map([[k0, start]]);
   const parent = new Map([[k0, { p: null }]]);
@@ -547,22 +726,28 @@ export function explore(model, onProgress) {
       violation: false,
       summary,
       terminalSnapshot: snapshot(model, terminalState, null),
+      prefixLength: prefixActions.length,
+      ...(prefixActions.length
+        ? { prefixActions, startSnapshot: snapshot(model, start, null) }
+        : {}),
     };
   }
 
-  // 重建最短见证动作序列，并从初态逐步重放取得每步双模块快照
+  // 重建最短后续动作序列；完整见证 = 现场前缀 + 最短后续，自初态逐步重放取快照
   const getEdge = (k) => (bestNode.badParent?.get(k) ?? parent.get(k));
-  const actions = [];
+  const contActions = [];
   for (let k = bestNode.key; ; ) {
     const e = getEdge(k);
     if (!e || e.p === null) break;
-    actions.push({ m: e.m, kind: e.kind, i: e.i });
+    contActions.push({ m: e.m, kind: e.kind, i: e.i, prefix: false });
     k = e.p;
   }
-  actions.reverse();
+  contActions.reverse();
+  const actions = [...prefixActions, ...contActions];
 
-  const steps = [snapshot(model, start, null)];
-  let s = start;
+  const s0 = prefixActions.length ? initialState(model) : start;
+  const steps = [snapshot(model, s0, null)];
+  let s = s0;
   for (const a of actions) {
     const ts = transitions(s, model);
     const t = ts.find((x) => x.m === a.m && x.kind === a.kind && x.i === a.i);
@@ -585,6 +770,10 @@ export function explore(model, onProgress) {
     witnessActions: actions,
     steps,
     summary,
+    prefixLength: prefixActions.length,
+    ...(prefixActions.length
+      ? { prefixActions, startSnapshot: snapshot(model, start, null) }
+      : {}),
   };
 }
 
@@ -598,7 +787,9 @@ function snapshot(model, s, action) {
       .filter((x) => x.bits),
   });
   return {
-    action: action ? { module: action.m, kind: action.kind, index: action.i } : null,
+    action: action
+      ? { module: action.m, kind: action.kind, index: action.i, prefix: !!action.prefix }
+      : null,
     modules: [fmt(0), fmt(1)],
   };
 }
@@ -606,7 +797,17 @@ function snapshot(model, s, action) {
 export function analyze(raw, onProgress) {
   const parsed = parseModel(raw);
   if (parsed.errors) return { ok: false, errors: parsed.errors };
-  const report = explore(parsed.model, onProgress);
+  const model = parsed.model;
+  let startState;
+  let prefixActions = [];
+  if (model.prefix.length) {
+    // 现场前缀：先按既有持久化语义逐步归约；首个不可能发生的步骤即整体拒绝
+    const reduced = reducePrefix(model, model.prefix);
+    if (reduced.error) return { ok: false, errors: [reduced.error] };
+    startState = reduced.state;
+    prefixActions = reduced.actions;
+  }
+  const report = explore(model, onProgress, { startState, prefixActions });
   if (report.cancelled) return { ok: false, cancelled: true };
   return {
     ok: true,
@@ -620,6 +821,13 @@ export function analyze(raw, onProgress) {
         op: x.op,
         target: x.target,
         arg: x.arg,
+        text: x.text,
+      })),
+      prefix: parsed.model.prefix.map((x) => ({
+        evt: x.evt,
+        m: x.m,
+        i: x.i,
+        lineNo: x.lineNo,
         text: x.text,
       })),
     },

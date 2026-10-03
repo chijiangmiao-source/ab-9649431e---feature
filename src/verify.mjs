@@ -1,7 +1,8 @@
 // verify 服务：围绕本轮换场景依次运行
-//   1) 核心状态测试（node --test）
+//   1) 核心状态测试（node --test：含现场前缀归约、非法前缀定位、无前缀兼容性）
 //   2) 静态构建检查（所有被引用的前端/Worker/核心文件存在且语法可解析）
-//   3) 页面与健康地址 HTTP 冒烟
+//   3) Worker 运行时冒烟（web/worker.mjs 页面流程：违约 / 安全 / 现场前缀 / 非法前缀）
+//   4) 页面与健康地址 HTTP 冒烟（含现场前缀录入入口）
 // 全部通过退出码 0，任一步失败退出码 1。
 import { spawn } from 'node:child_process';
 import { readFile, access } from 'node:fs/promises';
@@ -137,8 +138,10 @@ async function httpSmoke() {
   let ok = true;
   ok = ok && (await expect('/healthz', { status: 200, contains: '"status":"ok"', contentType: 'application/json' }));
   ok = ok && (await expect('/', { status: 200, contains: '航电密钥轮换复核台', contentType: 'text/html' }));
+  ok = ok && (await expect('/', { status: 200, contains: '现场事件前缀' }));
   ok = ok && (await expect('/index.html', { status: 200, contains: '/app.js' }));
   ok = ok && (await expect('/app.js', { status: 200, contains: 'worker.mjs' }));
+  ok = ok && (await expect('/app.js', { status: 200, contains: 'prefixText' }));
   ok = ok && (await expect('/worker.mjs', { status: 200, contains: 'analyze' }));
   ok = ok && (await expect('/src/core.mjs', { status: 200, contains: 'explore' }));
   ok = ok && (await expect('/styles.css', { status: 200, contentType: 'text/css' }));
@@ -202,7 +205,56 @@ async function workerSmoke() {
     log('worker', `安全场景结果异常：${JSON.stringify(safe).slice(0, 300)}`);
     return false;
   }
-  log('worker', 'Worker 运行时冒烟通过（违约检出 / 安全结论 / 进度回传）');
+  // 含现场前缀的违约复核：前缀归约后剩余交织仍达违约，完整见证自前缀起展示
+  const prefixed = await run({
+    oldFp: 'OLD-FP',
+    newFp: 'NEW-FP',
+    modules: [mk('M1'), mk('M2')],
+    instructionsText:
+      'prepare M1 OLD-FP\nactivate M1\nissue M1 R\nprepare M2 NEW-FP\nactivate M2\nissue M2 R',
+    prefixText: '投递 M1 #0\n落盘 M1 #0\n确认 M1 #0',
+  });
+  if (
+    !prefixed.ok ||
+    !prefixed.report.violation ||
+    prefixed.report.prefixLength !== 3 ||
+    prefixed.report.witnessActions.length !== 16 ||
+    !prefixed.report.witnessActions.slice(0, 3).every((a) => a.prefix === true) ||
+    !prefixed.report.witnessActions.slice(3).every((a) => a.prefix === false)
+  ) {
+    log('worker', `现场前缀违约场景结果异常：${JSON.stringify(prefixed).slice(0, 300)}`);
+    return false;
+  }
+  // 含现场前缀的安全复核：归约后剩余交织安全，覆盖摘要保留
+  const safePrefixed = await run({
+    oldFp: 'OLD-FP',
+    newFp: 'NEW-FP',
+    modules: [mk('M1'), mk('M2')],
+    instructionsText: 'prepare M1 NEW-FP\nactivate M1\nissue M1 S\nprepare M2 NEW-FP\nactivate M2\nissue M2 S',
+    prefixText: '投递 M1 #0\n落盘 M1 #0\n确认 M1 #0',
+  });
+  if (
+    !safePrefixed.ok ||
+    safePrefixed.report.violation ||
+    safePrefixed.report.prefixLength !== 3 ||
+    !safePrefixed.report.startSnapshot
+  ) {
+    log('worker', `现场前缀安全场景结果异常：${JSON.stringify(safePrefixed).slice(0, 300)}`);
+    return false;
+  }
+  // 不可能发生的现场前缀：稳定定位首个不合法步骤并拒绝
+  const badPrefix = await run({
+    oldFp: 'OLD-FP',
+    newFp: 'NEW-FP',
+    modules: [mk('M1'), mk('M2')],
+    instructionsText: 'prepare M1 NEW-FP\nactivate M1\nissue M1 S\nprepare M2 NEW-FP\nactivate M2\nissue M2 S',
+    prefixText: '确认 M1 #0',
+  });
+  if (badPrefix.ok || !/现场前缀第 1 步/.test((badPrefix.errors || []).join('\n'))) {
+    log('worker', `非法现场前缀场景结果异常：${JSON.stringify(badPrefix).slice(0, 300)}`);
+    return false;
+  }
+  log('worker', 'Worker 运行时冒烟通过（违约检出 / 安全结论 / 现场前缀归约 / 非法前缀定位 / 进度回传）');
   return true;
 }
 
